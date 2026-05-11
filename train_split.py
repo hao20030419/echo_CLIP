@@ -70,8 +70,8 @@ def train():
     pos_dir = os.path.join("data", "positive")
     neg_dir = os.path.join("data", "negative")
     
-    pos_files = glob.glob(os.path.join(pos_dir, "*.avi"))
-    neg_files = glob.glob(os.path.join(neg_dir, "*.avi"))
+    pos_files = glob.glob(os.path.join(pos_dir, "*.mp4"))
+    neg_files = glob.glob(os.path.join(neg_dir, "*.mp4"))
     
     all_files = pos_files + neg_files
     all_labels = [1] * len(pos_files) + [0] * len(neg_files)
@@ -80,21 +80,42 @@ def train():
         print("找不到影片檔！請先將影片準備好再執行。")
         return
 
-    # 切分 Train (80%) / Temp (20%)，再從 Temp 切出 Val(10%) 跟 Test(10%) -> test_size=0.5
-    train_files, temp_files, train_labels, temp_labels = train_test_split(
-        all_files, all_labels, test_size=0.2, random_state=42, stratify=all_labels
-    )
-    val_files, test_files, val_labels, test_labels = train_test_split(
-        temp_files, temp_labels, test_size=0.5, random_state=42, stratify=temp_labels
-    )
+    # 嘗試進行分層切分 Train (80%) / Temp (20%)，再由 Temp 均分給 Val (10%) 與 Test (10%)
+    try:
+        train_files, temp_files, train_labels, temp_labels = train_test_split(
+            all_files, all_labels, test_size=0.2, random_state=42, stratify=all_labels
+        )
+        val_files, test_files, val_labels, test_labels = train_test_split(
+            temp_files, temp_labels, test_size=0.5, random_state=42, stratify=temp_labels
+        )
+    except ValueError:
+        print("警告：資料量過少，無法確保資料類別比例 (stratify)，改為一般隨機切分...")
+        train_files, temp_files, train_labels, temp_labels = train_test_split(
+            all_files, all_labels, test_size=0.2, random_state=42
+        )
+        if len(temp_files) >= 2:
+            val_files, test_files, val_labels, test_labels = train_test_split(
+                temp_files, temp_labels, test_size=0.5, random_state=42
+            )
+        else:
+            # 如果資料真的極少，把剩下的所有檔案都塞給 val 當作測試用
+            val_files, val_labels = temp_files, temp_labels
+            test_files, test_labels = [], []
 
     print(f"Dataset split: Train={len(train_files)} Val={len(val_files)} Test={len(test_files)}")
 
     train_dataset = EchoDataset(train_files, train_labels, preprocess_val)
     val_dataset = EchoDataset(val_files, val_labels, preprocess_val)
     
-    train_loader = DataLoader(train_dataset, batch_size=4, shuffle=True, drop_last=True)
-    val_loader = DataLoader(val_dataset, batch_size=4, shuffle=False, drop_last=True)
+    # 防止當 batch 數量比 batch_size 小時報錯，若是資料太少，把 drop_last 關掉或換 batch_size
+    train_bs = min(4, len(train_dataset)) if len(train_dataset) > 0 else 1
+    val_bs = min(4, len(val_dataset)) if len(val_dataset) > 0 else 1
+
+    train_loader = DataLoader(train_dataset, batch_size=train_bs, shuffle=True, drop_last=(len(train_dataset)>train_bs))
+    if len(val_dataset) > 0:
+        val_loader = DataLoader(val_dataset, batch_size=val_bs, shuffle=False, drop_last=(len(val_dataset)>val_bs))
+    else:
+        val_loader = []
     
     optimizer = torch.optim.AdamW([
         {'params': model.parameters(), 'lr': 1e-6},
