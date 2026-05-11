@@ -32,10 +32,26 @@ class EchoDataset(Dataset):
         
         try:
             frames = read_avi(file_path, (224, 224))
+            
+            # 從所有影格中均勻抽取 10 個 frame，讓每支影片的時間維長度都一致且適應記憶體
+            num_frames = len(frames)
+            if num_frames > 0:
+                import numpy as np
+                indices = np.linspace(0, num_frames - 1, 10, dtype=int)
+                sampled_frames = [frames[i] for i in indices]
+            else:
+                sampled_frames = []
+                
             video_tensor = torch.stack(
-                [self.preprocess_val(T.ToPILImage()(frame)) for frame in frames], dim=0
+                [self.preprocess_val(T.ToPILImage()(frame)) for frame in sampled_frames], dim=0
             )
+            # 確保最後出來一定是 10 frames，如果原始影片有問題則報錯走 except
+            if video_tensor.shape[0] != 10:
+                raise ValueError("Frames count is not 10")
+                
         except Exception as e:
+            # 發生錯誤或者影片毀損時，給定全零的 10 frames (10, 3, 224, 224) 確保訓練不中斷
+            print(f"[{file_path}] Read warning: {e}")
             video_tensor = torch.zeros((10, 3, 224, 224))
         
         tokens = self.pos_tokens if label == 1 else self.neg_tokens
