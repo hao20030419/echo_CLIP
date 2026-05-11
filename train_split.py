@@ -64,8 +64,7 @@ def train():
         "hf-hub:mkaichristensen/echo-clip-r", precision="bf16", device=device
     )
     
-    logit_scale = torch.nn.Parameter(torch.ones([]) * 2.6592)
-    logit_scale = logit_scale.to(device)
+    logit_scale = torch.nn.Parameter(torch.ones([], device=device) * 2.6592)
 
     pos_dir = os.path.join("data", "positive")
     neg_dir = os.path.join("data", "negative")
