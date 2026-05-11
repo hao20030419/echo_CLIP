@@ -58,17 +58,30 @@ class EchoDataset(Dataset):
         
         return video_tensor, tokens
 
-def contrastive_loss(video_embeddings, text_embeddings, logit_scale):
+def contrastive_loss(video_embeddings, text_embeddings, logit_scale, batch_labels):
+    """
+    Supervised Soft-Label Contrastive Loss.
+    因為我們只有兩種文字 Prompt，同一個 Batch 裡會有多個 video 共享相同的 text embedding。
+    標準 InfoNCE 會把這些相同的 text 當成 Negative，導致梯度互相打架。
+    這裡改用 Soft Label：同一類別的所有 (video, text) pair 都算 Positive，
+    並且對每一列做 normalization，讓 loss 正確引導模型學習。
+    """
     video_embeddings = F.normalize(video_embeddings, dim=-1)
     text_embeddings = F.normalize(text_embeddings, dim=-1)
     
-    logits_per_video = logit_scale * (video_embeddings @ text_embeddings.T)
-    logits_per_text = logits_per_video.T
+    logits = logit_scale * (video_embeddings @ text_embeddings.T)  # (B, B)
     
-    labels = torch.arange(video_embeddings.size(0), device=video_embeddings.device)
+    # 建立 Soft Target 矩陣：對 video_i，所有與它 label 相同的 text_j 都是正確答案
+    labels_t = batch_labels.unsqueeze(0)  # (1, B)
+    labels_v = batch_labels.unsqueeze(1)  # (B, 1)
+    soft_targets = (labels_v == labels_t).float()  # (B, B)
+    # 每列做正規化，讓每個 video 的正確答案比例加總為 1
+    soft_targets = soft_targets / soft_targets.sum(dim=1, keepdim=True)
     
-    loss_v = F.cross_entropy(logits_per_video, labels)
-    loss_t = F.cross_entropy(logits_per_text, labels)
+    # Soft Cross Entropy (Video -> Text)
+    loss_v = -(soft_targets * F.log_softmax(logits, dim=1)).sum(dim=1).mean()
+    # Soft Cross Entropy (Text -> Video)
+    loss_t = -(soft_targets.T * F.log_softmax(logits.T, dim=1)).sum(dim=1).mean()
     
     return (loss_v + loss_t) / 2
 
@@ -161,7 +174,17 @@ def train():
             video_embeds = frame_embeds.mean(dim=1)
             text_embeds = model.encode_text(batch_texts)
             
-            loss = contrastive_loss(video_embeds, text_embeds, torch.exp(logit_scale))
+            # clamp 防止 logit_scale 爆炸 (CLIP 論文建議上限為 ln(100) ≈ 4.6)
+            logit_scale.data.clamp_(0, 4.6052)
+
+            # 透過比對 token 來還原當前 batch 每個樣本的 label
+            pos_tokens_ref = train_dataset.pos_tokens.to(device)
+            batch_labels = torch.tensor(
+                [1 if torch.equal(batch_texts[i], pos_tokens_ref) else 0
+                 for i in range(batch_texts.size(0))],
+                device=device
+            )
+            loss = contrastive_loss(video_embeds, text_embeds, torch.exp(logit_scale), batch_labels)
             
             loss.backward()
             optimizer.step()
@@ -189,7 +212,13 @@ def train():
                 video_embeds = frame_embeds.mean(dim=1)
                 text_embeds = model.encode_text(batch_texts)
                 
-                loss = contrastive_loss(video_embeds, text_embeds, torch.exp(logit_scale))
+                pos_tokens_ref = train_dataset.pos_tokens.to(device)
+                batch_labels = torch.tensor(
+                    [1 if torch.equal(batch_texts[i], pos_tokens_ref) else 0
+                     for i in range(batch_texts.size(0))],
+                    device=device
+                )
+                loss = contrastive_loss(video_embeds, text_embeds, torch.exp(logit_scale), batch_labels)
                 
                 total_val_loss += loss.item()
                 val_pbar.set_postfix({'loss': f"{loss.item():.4f}"})
