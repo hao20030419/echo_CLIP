@@ -1,6 +1,7 @@
 import argparse
 import csv
 import random
+import shutil
 from pathlib import Path
 
 import cv2
@@ -115,47 +116,64 @@ def parse_args():
     return parser.parse_args()
 
 
-def stratified_video_split(pos_videos, neg_videos, train_ratio, val_ratio, test_ratio, random_seed):
+def can_stratify(labels):
+    if len(labels) < 2:
+        return False
+    classes = set(labels)
+    if len(classes) < 2:
+        return False
+    class_counts = [labels.count(c) for c in classes]
+    return min(class_counts) >= 2
+
+
+def split_rows_frame_level(rows, train_ratio, val_ratio, test_ratio, random_seed):
     ratios_sum = train_ratio + val_ratio + test_ratio
     if abs(ratios_sum - 1.0) > 1e-6:
         raise ValueError("train/val/test ratio must sum to 1.0")
 
-    all_videos = pos_videos + neg_videos
-    all_labels = [1] * len(pos_videos) + [0] * len(neg_videos)
+    if len(rows) == 0:
+        return [], [], []
 
-    if len(all_videos) == 0:
-        return [], [], [], [], [], []
+    indices = list(range(len(rows)))
+    labels = [1 if row["label"] == "positive" else 0 for row in rows]
 
     if val_ratio == 0 and test_ratio == 0:
-        return all_videos, [], [], all_labels, [], []
+        return indices, [], []
 
     temp_ratio = val_ratio + test_ratio
-    train_videos, temp_videos, train_labels, temp_labels = train_test_split(
-        all_videos,
-        all_labels,
+    train_idx, temp_idx, _, temp_labels = train_test_split(
+        indices,
+        labels,
         test_size=temp_ratio,
         random_state=random_seed,
-        stratify=all_labels if len(set(all_labels)) > 1 else None,
+        stratify=labels if can_stratify(labels) else None,
     )
 
-    if len(temp_videos) == 0:
-        return train_videos, [], [], train_labels, [], []
+    if len(temp_idx) == 0:
+        return train_idx, [], []
 
     if val_ratio == 0:
-        return train_videos, [], temp_videos, train_labels, [], temp_labels
+        return train_idx, [], temp_idx
     if test_ratio == 0:
-        return train_videos, temp_videos, [], train_labels, temp_labels, []
+        return train_idx, temp_idx, []
 
     val_fraction_in_temp = val_ratio / (val_ratio + test_ratio)
-    val_videos, test_videos, val_labels, test_labels = train_test_split(
-        temp_videos,
+    val_idx, test_idx, _, _ = train_test_split(
+        temp_idx,
         temp_labels,
         test_size=(1 - val_fraction_in_temp),
         random_state=random_seed,
-        stratify=temp_labels if len(set(temp_labels)) > 1 else None,
+        stratify=temp_labels if can_stratify(temp_labels) else None,
     )
 
-    return train_videos, val_videos, test_videos, train_labels, val_labels, test_labels
+    return train_idx, val_idx, test_idx
+
+
+def reset_output_dirs(out_root: Path):
+    for folder_name in ["all", "train", "val", "test"]:
+        folder_path = out_root / folder_name
+        if folder_path.exists():
+            shutil.rmtree(folder_path)
 
 
 def write_metadata_csv(rows, csv_path: Path):
@@ -191,57 +209,77 @@ def main():
 
     print(f"Found videos: positive={len(pos_videos)} negative={len(neg_videos)}")
 
+    reset_output_dirs(out_root)
+
     max_frames_per_video = args.max_frames_per_video if args.max_frames_per_video > 0 else None
     target_fps = args.target_fps if args.target_fps > 0 else None
     resize = (args.resize_width, args.resize_height) if args.resize_width > 0 and args.resize_height > 0 else None
 
-    train_videos, val_videos, test_videos, _, _, _ = stratified_video_split(
-        pos_videos,
-        neg_videos,
+    all_rows = []
+    errors = []
+
+    all_videos = pos_videos + neg_videos
+    print(f"Step 1/2: extracting all frames from {len(all_videos)} videos...")
+    for video_path in tqdm(all_videos, desc="all videos"):
+        label_name = "positive" if "positive" in str(video_path).replace("\\", "/") else "negative"
+        rows, err = extract_frames_for_video(
+            video_path=video_path,
+            label_name=label_name,
+            split_name="all",
+            output_root=out_root,
+            frame_stride=args.frame_stride,
+            max_frames_per_video=max_frames_per_video,
+            target_fps=target_fps,
+            resize=resize,
+            jpeg_quality=args.jpeg_quality,
+        )
+
+        if err is not None:
+            errors.append(err)
+            continue
+        all_rows.extend(rows)
+
+    if len(all_rows) == 0:
+        raise RuntimeError("No frames extracted. Please check video readability or extraction settings.")
+
+    print(f"Extracted frames: {len(all_rows)}")
+    print("Step 2/2: splitting extracted frames into train/val/test...")
+
+    train_idx, val_idx, test_idx = split_rows_frame_level(
+        all_rows,
         args.train_ratio,
         args.val_ratio,
         args.test_ratio,
         args.random_seed,
     )
 
-    split_to_videos = {
-        "train": train_videos,
-        "val": val_videos,
-        "test": test_videos,
-    }
+    split_map = {"train": train_idx, "val": val_idx, "test": test_idx}
 
-    all_rows = []
-    errors = []
+    for split_name, idx_list in split_map.items():
+        for idx in idx_list:
+            row = all_rows[idx]
+            src = Path(row["frame_path"])
+            dst_dir = out_root / split_name / row["label"]
+            dst_dir.mkdir(parents=True, exist_ok=True)
+            dst = dst_dir / src.name
+            src.replace(dst)
 
-    for split_name, videos in split_to_videos.items():
-        if len(videos) == 0:
-            continue
+            row["split"] = split_name
+            row["frame_path"] = str(dst)
 
-        print(f"Extracting split={split_name}, videos={len(videos)}")
-        for video_path in tqdm(videos, desc=f"{split_name} videos"):
-            label_name = "positive" if "positive" in str(video_path).replace("\\", "/") else "negative"
-            rows, err = extract_frames_for_video(
-                video_path=video_path,
-                label_name=label_name,
-                split_name=split_name,
-                output_root=out_root,
-                frame_stride=args.frame_stride,
-                max_frames_per_video=max_frames_per_video,
-                target_fps=target_fps,
-                resize=resize,
-                jpeg_quality=args.jpeg_quality,
-            )
+    all_rows = [row for row in all_rows if row["split"] in {"train", "val", "test"}]
 
-            if err is not None:
-                errors.append(err)
-                continue
-            all_rows.extend(rows)
+    # Remove temporary unsplit folder after moving all frames.
+    all_dir = out_root / "all"
+    if all_dir.exists():
+        shutil.rmtree(all_dir)
 
     metadata_path = out_root / "frames_metadata.csv"
     write_metadata_csv(all_rows, metadata_path)
 
     print(f"Done. Total frames: {len(all_rows)}")
     print(f"Metadata CSV: {metadata_path}")
+    print(f"Split counts: train={len(train_idx)} val={len(val_idx)} test={len(test_idx)}")
     print("Dataset layout example:")
     print(f"  {out_root}/train/positive/*.jpg")
     print(f"  {out_root}/train/negative/*.jpg")
